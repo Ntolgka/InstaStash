@@ -45,6 +45,16 @@ class DownloadState:
         with self._lock:
             return key in self._completed
 
+    def folders_done_for(self, media_pk) -> list[str]:
+        """Folder names (from earlier runs) that already hold this post."""
+        pk = str(media_pk)
+        with self._lock:
+            return [
+                k.rsplit(":", 1)[0]
+                for k in self._completed
+                if k.rsplit(":", 1)[1] == pk
+            ]
+
     def mark_done(self, key: str) -> None:
         with self._lock:
             self._completed.add(key)

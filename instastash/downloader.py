@@ -11,6 +11,7 @@ half-written file that looks finished.
 from __future__ import annotations
 
 import os
+import shutil
 import threading
 import time
 from collections import deque
@@ -112,8 +113,12 @@ class DownloadWorker(threading.Thread):
         self.done = 0
         self.skipped = 0
         self.failed = 0
+        self.copied = 0
         self.total = 0
         self._last_progress_emit = 0.0
+        # media pk -> folder it was downloaded to earlier in this run, so a
+        # post saved in several collections is fetched once and copied.
+        self._run_locations: dict[str, Path] = {}
 
     # ----------------------------------------------------------------- events
 
@@ -141,6 +146,7 @@ class DownloadWorker(threading.Thread):
             total=self.total,
             skipped=self.skipped,
             failed=self.failed,
+            copied=self.copied,
             speed_bps=self.speed.bytes_per_second(),
             eta_seconds=eta,
         )
@@ -181,6 +187,7 @@ class DownloadWorker(threading.Thread):
                 total=self.total,
                 skipped=self.skipped,
                 failed=self.failed,
+                copied=self.copied,
             )
         except DownloadAborted:
             self._log("Stopped by user. Progress was saved — restart to resume.")
@@ -190,6 +197,7 @@ class DownloadWorker(threading.Thread):
                 total=self.total,
                 skipped=self.skipped,
                 failed=self.failed,
+                copied=self.copied,
                 aborted=True,
             )
         except Exception as exc:  # noqa: BLE001 - report anything to the UI
@@ -313,12 +321,21 @@ class DownloadWorker(threading.Thread):
             self._emit("item", description=f"{folder_name} / {basename}")
             started = time.monotonic()
             try:
-                self._download_media(media, folder, basename)
+                fully_copied = self._download_media(media, folder, basename)
                 self.state.mark_done(key)
                 if self.cache:
                     self.cache.mark_downloaded(entry["id"], entry["name"], media.pk)
                 self.done += 1
-                self.item_durations.append(time.monotonic() - started)
+                if fully_copied:
+                    self.copied += 1
+                    self._log(
+                        f'Copied "{basename}" from another collection folder '
+                        "(no re-download needed)."
+                    )
+                else:
+                    # Local copies are near-instant; only real downloads
+                    # should inform the ETA.
+                    self.item_durations.append(time.monotonic() - started)
             except DownloadAborted:
                 raise
             except Exception as exc:  # noqa: BLE001 - keep going on bad items
@@ -332,9 +349,16 @@ class DownloadWorker(threading.Thread):
         if self.cache and self.failed == failures_before:
             self.cache.advance_newest(entry["id"], entry["name"], entry["newest"])
 
-    def _download_media(self, media, folder: Path, basename: str) -> None:
-        """Download every file belonging to one post (1 for photo/video,
-        N for a carousel, named basename_1..N)."""
+    def _download_media(self, media, folder: Path, basename: str) -> bool:
+        """Get every file belonging to one post into `folder` (1 file for a
+        photo/video, N for a carousel, named basename_1..N).
+
+        A post saved in several collections is fetched from Instagram only
+        once: if another collection folder already holds the same files
+        (from this run or an earlier one), they are copied locally instead
+        of re-downloaded. Returns True when every needed file came from a
+        local copy.
+        """
         parts = self._media_parts(media)
         if not parts:
             raise ValueError("No downloadable URL found (post may be unavailable)")
@@ -342,15 +366,43 @@ class DownloadWorker(threading.Thread):
         timestamp = media.taken_at.timestamp() if media.taken_at else None
         if len(parts) == 1:
             url, media_type = parts[0]
-            dest = folder / f"{basename}{extension_from_url(url, media_type)}"
-            self._download_file(url, dest, timestamp)
+            filenames = [f"{basename}{extension_from_url(url, media_type)}"]
         else:
-            for i, (url, media_type) in enumerate(parts, start=1):
-                self._check_stop()
-                dest = folder / (
-                    f"{basename}_{i}{extension_from_url(url, media_type)}"
-                )
-                self._download_file(url, dest, timestamp)
+            filenames = [
+                f"{basename}_{i}{extension_from_url(url, media_type)}"
+                for i, (url, media_type) in enumerate(parts, start=1)
+            ]
+
+        source_folder = self._find_local_copy(media.pk, exclude=folder)
+        copied_any = False
+        downloaded_any = False
+        for (url, _media_type), filename in zip(parts, filenames):
+            self._check_stop()
+            dest = folder / filename
+            if dest.exists() and dest.stat().st_size > 0:
+                continue
+            if source_folder is not None:
+                source = source_folder / filename
+                if source.is_file() and source.stat().st_size > 0:
+                    shutil.copy2(source, dest)  # copy2 keeps the post date
+                    copied_any = True
+                    continue
+            self._download_file(url, dest, timestamp)
+            downloaded_any = True
+
+        self._run_locations[str(media.pk)] = folder
+        return copied_any and not downloaded_any
+
+    def _find_local_copy(self, media_pk, exclude: Path) -> Path | None:
+        """Another folder in this output dir that already holds this post."""
+        folder = self._run_locations.get(str(media_pk))
+        if folder is not None and folder != exclude and folder.is_dir():
+            return folder
+        for folder_name in self.state.folders_done_for(media_pk):
+            candidate = self.output_dir / folder_name
+            if candidate != exclude and candidate.is_dir():
+                return candidate
+        return None
 
     @staticmethod
     def _media_parts(media) -> list[tuple[str, int]]:

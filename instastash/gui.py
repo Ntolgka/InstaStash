@@ -462,8 +462,10 @@ class App(tk.Tk):
         percent = (processed / total * 100) if total else 0.0
         self.progress_bar.configure(value=percent)
         self.percent_label.configure(text=f"{percent:.0f}%")
+        copied = data.get("copied", 0)
+        copied_note = f" ({copied} copied locally)" if copied else ""
         self.overall_label.configure(
-            text=f"{processed}/{total} items — {done} downloaded, "
+            text=f"{processed}/{total} items — {done} downloaded{copied_note}, "
                  f"{skipped} already done, {failed} failed"
         )
         self.stats_label.configure(
@@ -478,9 +480,11 @@ class App(tk.Tk):
             self.overall_label.configure(text="Stopped. Progress saved.")
             return
         done, skipped, failed = data["done"], data["skipped"], data["failed"]
+        copied = data.get("copied", 0)
+        copied_note = f" ({copied} copied locally)" if copied else ""
         summary = (
-            f"Finished: {done} downloaded, {skipped} already done, "
-            f"{failed} failed."
+            f"Finished: {done} downloaded{copied_note}, {skipped} already "
+            f"done, {failed} failed."
         )
         self.overall_label.configure(text=summary)
         self._log_line(summary)

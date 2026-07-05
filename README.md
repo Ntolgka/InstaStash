@@ -8,6 +8,10 @@ saved in a collection called `ASD`, it lands in an `ASD/` folder on disk.
 
 - **Collection-aware** — every saved collection becomes a folder with the same
   name; saved posts that are in no collection go to `Uncategorized/`.
+- **Multi-collection posts, downloaded once** — a post saved in collections
+  X, Y and Z appears in all three folders, but its files are fetched from
+  Instagram only once and copied locally to the other folders (works across
+  runs too, as long as the earlier copy is still on disk).
 - **Source quality** — photos and videos are downloaded from Instagram's CDN
   at the highest resolution Instagram serves.
 - **Clean, unique filenames** — `2024-03-17_natgeo_C4kXbQwJx1a.jpg`
