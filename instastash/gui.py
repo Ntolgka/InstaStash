@@ -256,7 +256,7 @@ class App(tk.Tk):
         self.only_new_var = tk.BooleanVar(value=True)
         IGCheckbutton(
             options_row,
-            "Only download new items (items from previous runs are skipped)",
+            "Only download new items (skips previous runs)",
             self.only_new_var,
         ).pack(side="left")
         reset_link = tk.Label(

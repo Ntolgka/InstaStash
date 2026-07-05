@@ -318,7 +318,7 @@ class DownloadWorker(threading.Thread):
 
     # ------------------------------------------------------------------ plan
 
-    def _fetch_new(self, collection_id: str, name: str) -> tuple[list, int]:
+    def _fetch_new(self, collection_id: str) -> tuple[list, int]:
         """Fetch a collection's items, incrementally when the cache allows.
 
         Returns (medias newest-first, newest_pk_candidate). The candidate is
@@ -353,7 +353,7 @@ class DownloadWorker(threading.Thread):
         for collection in self.selected:
             self._check_stop()
             self._log(f'Fetching item list for "{collection.name}"...')
-            medias, newest = self._fetch_new(collection.id, collection.name)
+            medias, newest = self._fetch_new(collection.id)
             folder = self._unique_folder_name(collection.name, used_names)
             plan.append({
                 "id": collection.id, "name": collection.name,
@@ -386,7 +386,7 @@ class DownloadWorker(threading.Thread):
                 )
 
             self._log("Fetching the saved list...")
-            all_saved, newest = self._fetch_new(UNCATEGORIZED_ID, UNCATEGORIZED_FOLDER)
+            all_saved, newest = self._fetch_new(UNCATEGORIZED_ID)
             leftovers = [m for m in all_saved if m.pk not in assigned_pks]
             folder = self._unique_folder_name(UNCATEGORIZED_FOLDER, used_names)
             plan.append({
