@@ -29,8 +29,9 @@ import threading
 from pathlib import Path
 
 from .naming import sanitize_name
+from .paths import data_dir
 
-CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
+CACHE_DIR = data_dir() / "cache"
 
 
 class AccountCache:

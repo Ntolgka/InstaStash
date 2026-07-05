@@ -29,3 +29,8 @@ Thumbs.db
 
 # Local task notes
 Tasks.md
+
+# Packaging artifacts (PyInstaller)
+build/
+dist/
+*.spec

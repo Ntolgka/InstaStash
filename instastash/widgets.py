@@ -302,6 +302,43 @@ class IGCheckbutton(tk.Frame):
             pass
 
 
+class Segmented(tk.Frame):
+    """Small segmented picker (e.g. 1 | 2 | 3); selected pill is blue."""
+
+    def __init__(self, parent, values: list, variable: tk.IntVar,
+                 bg: str = theme.CARD):
+        super().__init__(parent, bg=bg)
+        self._var = variable
+        self._pills: dict = {}
+        for value in values:
+            pill = tk.Label(
+                self, text=str(value), font=(theme.FAMILY, 11, "bold"),
+                padx=12, pady=3, cursor="hand2", bd=0,
+            )
+            pill.pack(side="left", padx=2)
+            pill.bind("<Button-1>", lambda _e, v=value: self._var.set(v))
+            self._pills[value] = pill
+        self._trace = variable.trace_add("write", lambda *_a: self._sync())
+        self.bind("<Destroy>", self._remove_trace)
+        self._sync()
+
+    def _sync(self) -> None:
+        current = self._var.get()
+        for value, pill in self._pills.items():
+            if not pill.winfo_exists():
+                return
+            if value == current:
+                pill.configure(bg=theme.BLUE, fg="#FFFFFF")
+            else:
+                pill.configure(bg="#EFEFEF", fg=theme.TEXT)
+
+    def _remove_trace(self, _event) -> None:
+        try:
+            self._var.trace_remove("write", self._trace)
+        except Exception:  # noqa: BLE001 - var may already be gone at teardown
+            pass
+
+
 class Card(tk.Frame):
     """White panel with a hairline border; optional bold title row."""
 

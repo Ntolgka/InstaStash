@@ -31,6 +31,21 @@ saved in a collection called `ASD`, it lands in an `ASD/` folder on disk.
 - **Choose your output folder** — anywhere on your disk.
 - **Session reuse** — after the first login a session is stored locally
   (`session.json`), so future runs usually will not ask Instagram again.
+- **Rate-limit auto-pause** — if Instagram asks the app to slow down during
+  a big run, it pauses with a live countdown and resumes by itself instead
+  of stopping with an error.
+- **Mid-run re-login** — if the session expires during a long download, a
+  small dialog asks for your password and the download continues exactly
+  where it paused.
+- **Captions & links (optional)** — tick *"Save captions & post links as
+  .txt files"* to get a small text file next to each item with the post URL,
+  author, date and full caption.
+- **Parallel downloads** — choose 1, 2 or 3 simultaneous downloads with the
+  *Parallel downloads* switch (1 = one-by-one, the gentle default).
+- **Failed-items report** — items that could not be downloaded (usually
+  deleted or private posts) are listed in `failed_items.txt` in the output
+  folder with their post links; the file is removed automatically after a
+  fully clean run.
 
 ## Requirements
 
@@ -134,6 +149,29 @@ and nothing old is repeated.
   account's history and treat everything as new again.
 - Untick *"Only download new items"* for one run to re-list everything
   (files already inside the chosen output folder are still skipped).
+
+## Building a standalone app (optional)
+
+You can bundle InstaStash into a double-clickable app that needs no Python
+installation (the packaged app stores its session and download memory in
+your user data folder instead of next to the code):
+
+```bash
+# macOS (from the project folder, inside the venv)
+pip install pyinstaller
+pyinstaller --noconfirm --windowed --name InstaStash main.py
+# → dist/InstaStash.app  (first launch: right-click → Open, because it is unsigned)
+```
+
+```powershell
+# Windows
+pip install pyinstaller
+pyinstaller --noconfirm --windowed --name InstaStash main.py
+# → dist\InstaStash\InstaStash.exe (SmartScreen: "More info" → "Run anyway")
+```
+
+The build is platform-specific — build on macOS to get the Mac app, on
+Windows to get the .exe.
 
 ## Troubleshooting
 

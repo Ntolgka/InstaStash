@@ -19,13 +19,15 @@ from tkinter import filedialog, messagebox, ttk
 from . import theme
 from .cache import AccountCache
 from .client import InstagramClient, LoginError
+from .paths import data_dir
 from .downloader import DownloadWorker, Event
 from .widgets import (
     Card, GradientBanner, IGCheckbutton, PlaceholderEntry, RoundedButton,
+    Segmented,
 )
 
 APP_TITLE = "InstaStash"
-SESSION_FILE = Path(__file__).resolve().parent.parent / "session.json"
+SESSION_FILE = data_dir() / "session.json"
 
 
 def _format_bytes_per_second(bps: float) -> str:
@@ -264,6 +266,23 @@ class App(tk.Tk):
         reset_link.pack(side="right")
         reset_link.bind("<Button-1>", lambda _e: self._reset_cache())
 
+        options_row2 = tk.Frame(out_card.inner, bg=theme.CARD)
+        options_row2.pack(fill="x", pady=(6, 0))
+        self.sidecars_var = tk.BooleanVar(value=False)
+        IGCheckbutton(
+            options_row2,
+            "Save captions & post links as .txt files",
+            self.sidecars_var,
+        ).pack(side="left")
+        self.concurrency_var = tk.IntVar(value=1)
+        Segmented(options_row2, [1, 2, 3], self.concurrency_var).pack(
+            side="right"
+        )
+        tk.Label(
+            options_row2, text="Parallel downloads:", bg=theme.CARD,
+            fg=theme.SUBTEXT, font=(theme.FAMILY, 11),
+        ).pack(side="right", padx=(0, 6))
+
         # --- controls ----------------------------------------------------------
         controls = tk.Frame(frame, bg=theme.BG)
         controls.pack(fill="x", pady=(12, 0))
@@ -322,6 +341,86 @@ class App(tk.Tk):
             relief="flat", bd=0, padx=8, pady=6, font=(theme.MONO, 10),
         )
         self.log_text.pack(fill="both", expand=True, pady=(10, 0))
+
+    # ---------------------------------------------------------- re-login
+
+    def _show_relogin_dialog(self, username: str) -> None:
+        if getattr(self, "_relogin_dialog", None) is not None:
+            return
+
+        dialog = tk.Toplevel(self)
+        dialog.title("Session expired")
+        dialog.configure(bg=theme.CARD)
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        frame = tk.Frame(dialog, bg=theme.CARD, padx=28, pady=22)
+        frame.pack(fill="both", expand=True)
+        tk.Label(
+            frame,
+            text=f"Instagram signed @{username} out.\n"
+                 "Log in again to continue the download where it left off.",
+            bg=theme.CARD, fg=theme.TEXT, font=(theme.FAMILY, 11),
+            justify="center",
+        ).pack(pady=(0, 12))
+
+        password_entry = PlaceholderEntry(frame, "Password", show="•")
+        password_entry.pack(fill="x", ipady=6, pady=3)
+        twofa_entry = PlaceholderEntry(frame, "2FA code (optional)")
+        twofa_entry.pack(fill="x", ipady=6, pady=3)
+
+        status = tk.Label(frame, text="", bg=theme.CARD, fg=theme.RED,
+                          font=(theme.FAMILY, 10), wraplength=260)
+        status.pack(pady=(6, 0))
+
+        def attempt() -> None:
+            password = password_entry.value()
+            if not password:
+                status.configure(text="Please enter your password.",
+                                 fg=theme.RED)
+                return
+            login_button.configure(state="disabled")
+            status.configure(text="Logging in...", fg=theme.SUBTEXT)
+
+            def work() -> None:
+                try:
+                    self.ig.login(username, password,
+                                  twofa_entry.value().strip())
+                    self.events.put(Event("relogin_ok", {}))
+                except Exception as exc:  # noqa: BLE001
+                    self.events.put(Event("relogin_fail", {"message": str(exc)}))
+
+            threading.Thread(target=work, daemon=True,
+                             name="instastash-relogin").start()
+
+        def cancel() -> None:
+            # Giving up on re-login means the download cannot continue.
+            self.stop_event.set()
+            self._close_relogin_dialog()
+
+        buttons = tk.Frame(frame, bg=theme.CARD)
+        buttons.pack(pady=(10, 0))
+        login_button = RoundedButton(buttons, "Log in", command=attempt,
+                                     width=130, height=34)
+        login_button.pack(side="left", padx=(0, 8))
+        RoundedButton(buttons, "Stop download", command=cancel,
+                      kind="danger", width=130, height=34).pack(side="left")
+
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        self._relogin_dialog = dialog
+        self._relogin_status = status
+        self._relogin_button = login_button
+
+    def _close_relogin_dialog(self) -> None:
+        dialog = getattr(self, "_relogin_dialog", None)
+        if dialog is not None:
+            try:
+                dialog.grab_release()
+                dialog.destroy()
+            except tk.TclError:
+                pass
+            self._relogin_dialog = None
 
     def _reset_cache(self) -> None:
         if self.worker and self.worker.is_alive():
@@ -388,6 +487,8 @@ class App(tk.Tk):
             stop_event=self.stop_event,
             account_cache=self.account_cache,
             only_new=self.only_new_var.get(),
+            concurrency=self.concurrency_var.get(),
+            write_sidecars=self.sidecars_var.get(),
         )
         self.worker.start()
 
@@ -448,6 +549,17 @@ class App(tk.Tk):
             self.item_label.configure(text=f'Current: {data["description"]}')
         elif event.kind == "progress":
             self._update_progress(data)
+        elif event.kind == "relogin":
+            self._show_relogin_dialog(data["username"])
+        elif event.kind == "relogin_ok":
+            self._close_relogin_dialog()
+            if self.worker:
+                self.worker.relogin_event.set()
+        elif event.kind == "relogin_fail":
+            if getattr(self, "_relogin_dialog", None) is not None:
+                self._relogin_status.configure(text=data["message"],
+                                               fg=theme.RED)
+                self._relogin_button.configure(state="normal")
         elif event.kind == "finished":
             self._on_finished(data)
         elif event.kind == "error":
@@ -498,6 +610,7 @@ class App(tk.Tk):
     def _reset_buttons(self) -> None:
         self.start_button.configure(state="normal")
         self.stop_button.configure(state="disabled")
+        self._close_relogin_dialog()
 
     def _log_line(self, message: str) -> None:
         self.log_text.configure(state="normal")
