@@ -1,0 +1,25 @@
+# Claude working notes (per project convention)
+Claude/
+
+# Instagram session — contains auth tokens, NEVER commit
+session.json
+
+# Downloaded media / resume state (in case downloads land inside the repo)
+downloads/
+InstaStash/
+.instastash_state.json
+*.part
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
