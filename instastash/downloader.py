@@ -1,0 +1,402 @@
+"""Background download worker.
+
+Runs in its own thread, emits progress events into a queue that the GUI
+polls. Files are downloaded straight from Instagram's CDN at source quality
+(instagrapi always exposes the highest-resolution candidate URL), streamed in
+chunks so we can report live speed, and written to a ".part" temp file that
+is renamed only when complete — so an interrupted download never leaves a
+half-written file that looks finished.
+"""
+
+from __future__ import annotations
+
+import os
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from queue import Queue
+
+import requests
+
+from .cache import AccountCache
+from .client import InstagramClient
+from .naming import extension_from_url, media_basename, sanitize_name
+from .state import DownloadState
+
+CHUNK_SIZE = 64 * 1024
+MAX_RETRIES = 3
+SPEED_WINDOW_SECONDS = 8.0
+UNCATEGORIZED_FOLDER = "Uncategorized"
+UNCATEGORIZED_ID = "UNCATEGORIZED"
+
+
+class DownloadAborted(Exception):
+    """User pressed Stop."""
+
+
+@dataclass
+class Event:
+    """A progress event for the GUI. `kind` is one of:
+
+    log        - message: str
+    collection - name: str, index: int, count: int   (starting a collection)
+    item       - description: str                     (starting an item)
+    progress   - done, total, skipped, failed, speed_bps, eta_seconds
+    finished   - done, total, skipped, failed
+    error      - message: str
+    """
+
+    kind: str
+    data: dict = field(default_factory=dict)
+
+
+class _SpeedMeter:
+    """Rolling-window byte counter for live speed reporting."""
+
+    def __init__(self) -> None:
+        self._samples: deque[tuple[float, int]] = deque()
+        self._lock = threading.Lock()
+
+    def add(self, nbytes: int) -> None:
+        now = time.monotonic()
+        with self._lock:
+            self._samples.append((now, nbytes))
+            self._trim(now)
+
+    def bytes_per_second(self) -> float:
+        now = time.monotonic()
+        with self._lock:
+            self._trim(now)
+            if not self._samples:
+                return 0.0
+            total = sum(n for _, n in self._samples)
+            span = max(now - self._samples[0][0], 0.5)
+            return total / span
+
+    def _trim(self, now: float) -> None:
+        while self._samples and now - self._samples[0][0] > SPEED_WINDOW_SECONDS:
+            self._samples.popleft()
+
+
+class DownloadWorker(threading.Thread):
+    """Downloads the selected collections into the output folder."""
+
+    def __init__(
+        self,
+        ig: InstagramClient,
+        output_dir: Path,
+        selected_collections: list,
+        include_uncategorized: bool,
+        events: "Queue[Event]",
+        stop_event: threading.Event,
+        account_cache: AccountCache | None = None,
+        only_new: bool = True,
+    ) -> None:
+        super().__init__(daemon=True, name="instastash-download")
+        self.ig = ig
+        self.output_dir = Path(output_dir)
+        self.selected = selected_collections
+        self.include_uncategorized = include_uncategorized
+        self.events = events
+        self.stop_event = stop_event
+        self.cache = account_cache
+        self.only_new = only_new and account_cache is not None
+
+        self.state = DownloadState(self.output_dir)
+        self.speed = _SpeedMeter()
+        self.http = requests.Session()
+        self.item_durations: deque[float] = deque(maxlen=25)
+
+        self.done = 0
+        self.skipped = 0
+        self.failed = 0
+        self.total = 0
+        self._last_progress_emit = 0.0
+
+    # ----------------------------------------------------------------- events
+
+    def _emit(self, kind: str, **data) -> None:
+        self.events.put(Event(kind, data))
+
+    def _log(self, message: str) -> None:
+        self._emit("log", message=message)
+
+    def _emit_progress(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._last_progress_emit < 0.25:
+            return
+        self._last_progress_emit = now
+
+        remaining = max(self.total - self.done - self.skipped - self.failed, 0)
+        if self.item_durations:
+            avg = sum(self.item_durations) / len(self.item_durations)
+            eta = remaining * avg
+        else:
+            eta = None
+        self._emit(
+            "progress",
+            done=self.done,
+            total=self.total,
+            skipped=self.skipped,
+            failed=self.failed,
+            speed_bps=self.speed.bytes_per_second(),
+            eta_seconds=eta,
+        )
+
+    def _check_stop(self) -> None:
+        if self.stop_event.is_set():
+            raise DownloadAborted()
+
+    # ------------------------------------------------------------------- run
+
+    def run(self) -> None:
+        try:
+            plan = self._build_plan()
+            self.total = sum(len(entry["medias"]) for entry in plan)
+            if self.only_new:
+                self._log(
+                    f"Ready: {self.total} new item(s) across {len(plan)} "
+                    "folder(s) (previously downloaded items are skipped)."
+                )
+            else:
+                self._log(
+                    f"Ready: {self.total} items across {len(plan)} folder(s)."
+                )
+            self._emit_progress(force=True)
+
+            for index, entry in enumerate(plan, start=1):
+                self._check_stop()
+                self._emit(
+                    "collection", name=entry["folder"], index=index,
+                    count=len(plan),
+                )
+                self._download_collection(entry)
+
+            self._emit_progress(force=True)
+            self._emit(
+                "finished",
+                done=self.done,
+                total=self.total,
+                skipped=self.skipped,
+                failed=self.failed,
+            )
+        except DownloadAborted:
+            self._log("Stopped by user. Progress was saved — restart to resume.")
+            self._emit(
+                "finished",
+                done=self.done,
+                total=self.total,
+                skipped=self.skipped,
+                failed=self.failed,
+                aborted=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - report anything to the UI
+            self._emit(
+                "error",
+                message=f"{type(exc).__name__}: {exc}. "
+                "Progress was saved — restart the download to resume.",
+            )
+
+    # ------------------------------------------------------------------ plan
+
+    def _fetch_new(self, collection_id: str, name: str) -> tuple[list, int]:
+        """Fetch a collection's items, incrementally when the cache allows.
+
+        Returns (medias newest-first, newest_pk_candidate). The candidate is
+        the pk of the newest item Instagram reported; committing it to the
+        cache (only after a clean download run) lets the next fetch stop at
+        this point instead of re-listing everything.
+        """
+        last_pk = self.cache.newest_pk(collection_id) if self.only_new else 0
+        if collection_id == UNCATEGORIZED_ID:
+            medias = self.ig.all_saved_medias(last_media_pk=last_pk)
+        else:
+            medias = self.ig.collection_medias(collection_id, last_media_pk=last_pk)
+        newest_candidate = int(medias[0].pk) if medias else last_pk
+        if self.only_new:
+            medias = [
+                m for m in medias
+                if not self.cache.is_downloaded(collection_id, m.pk)
+            ]
+        return medias, newest_candidate
+
+    def _build_plan(self) -> list[dict]:
+        """Resolve which medias go into which folder.
+
+        Returns a list of {"id", "name", "folder", "medias", "newest"} dicts.
+        """
+        plan: list[dict] = []
+        used_names: set[str] = set()
+        assigned_pks: set = set()
+
+        for collection in self.selected:
+            self._check_stop()
+            self._log(f'Fetching item list for "{collection.name}"...')
+            medias, newest = self._fetch_new(collection.id, collection.name)
+            folder = self._unique_folder_name(collection.name, used_names)
+            plan.append({
+                "id": collection.id, "name": collection.name,
+                "folder": folder, "medias": medias, "newest": newest,
+            })
+            assigned_pks.update(m.pk for m in medias)
+            # Items downloaded in earlier runs still belong to this
+            # collection — they must not leak into "Uncategorized".
+            if self.cache:
+                assigned_pks.update(self.cache.downloaded_pks(collection.id))
+
+        if self.include_uncategorized:
+            self._check_stop()
+            # Items in *unselected* named collections are categorized too.
+            # Those need a full listing: we have no download memory that
+            # could stand in for their membership.
+            selected_ids = {c.id for c in self.selected}
+            for collection in self.ig.named_collections():
+                if collection.id in selected_ids:
+                    continue
+                self._check_stop()
+                self._log(
+                    f'Indexing "{collection.name}" (to keep "Uncategorized" clean)...'
+                )
+                assigned_pks.update(
+                    m.pk for m in self.ig.collection_medias(collection.id)
+                )
+
+            self._log("Fetching the saved list...")
+            all_saved, newest = self._fetch_new(UNCATEGORIZED_ID, UNCATEGORIZED_FOLDER)
+            leftovers = [m for m in all_saved if m.pk not in assigned_pks]
+            folder = self._unique_folder_name(UNCATEGORIZED_FOLDER, used_names)
+            plan.append({
+                "id": UNCATEGORIZED_ID, "name": UNCATEGORIZED_FOLDER,
+                "folder": folder, "medias": leftovers, "newest": newest,
+            })
+            if not leftovers:
+                self._log("No new uncategorized saved items found.")
+
+        return plan
+
+    @staticmethod
+    def _unique_folder_name(raw_name: str, used: set[str]) -> str:
+        base = sanitize_name(raw_name, fallback="Collection")
+        name, n = base, 2
+        while name.lower() in used:
+            name = f"{base} ({n})"
+            n += 1
+        used.add(name.lower())
+        return name
+
+    # ------------------------------------------------------------- downloads
+
+    def _download_collection(self, entry: dict) -> None:
+        folder_name, medias = entry["folder"], entry["medias"]
+        if medias:
+            folder = self.output_dir / folder_name
+            folder.mkdir(parents=True, exist_ok=True)
+
+            # Leftover temp files from a killed process are never valid.
+            for stale in folder.glob("*.part"):
+                stale.unlink(missing_ok=True)
+
+        failures_before = self.failed
+        for media in medias:
+            self._check_stop()
+            key = DownloadState.key(folder_name, media.pk)
+            if self.state.is_done(key):
+                self.skipped += 1
+                if self.cache:
+                    self.cache.mark_downloaded(entry["id"], entry["name"], media.pk)
+                self._emit_progress()
+                continue
+
+            basename = media_basename(media)
+            self._emit("item", description=f"{folder_name} / {basename}")
+            started = time.monotonic()
+            try:
+                self._download_media(media, folder, basename)
+                self.state.mark_done(key)
+                if self.cache:
+                    self.cache.mark_downloaded(entry["id"], entry["name"], media.pk)
+                self.done += 1
+                self.item_durations.append(time.monotonic() - started)
+            except DownloadAborted:
+                raise
+            except Exception as exc:  # noqa: BLE001 - keep going on bad items
+                self.failed += 1
+                self._log(f"FAILED {basename}: {type(exc).__name__}: {exc}")
+            self._emit_progress()
+
+        # Advance the incremental-fetch marker only after a clean pass:
+        # a failure or an abort must leave the marker behind, so the next
+        # run sees (and retries) everything from this point again.
+        if self.cache and self.failed == failures_before:
+            self.cache.advance_newest(entry["id"], entry["name"], entry["newest"])
+
+    def _download_media(self, media, folder: Path, basename: str) -> None:
+        """Download every file belonging to one post (1 for photo/video,
+        N for a carousel, named basename_1..N)."""
+        parts = self._media_parts(media)
+        if not parts:
+            raise ValueError("No downloadable URL found (post may be unavailable)")
+
+        timestamp = media.taken_at.timestamp() if media.taken_at else None
+        if len(parts) == 1:
+            url, media_type = parts[0]
+            dest = folder / f"{basename}{extension_from_url(url, media_type)}"
+            self._download_file(url, dest, timestamp)
+        else:
+            for i, (url, media_type) in enumerate(parts, start=1):
+                self._check_stop()
+                dest = folder / (
+                    f"{basename}_{i}{extension_from_url(url, media_type)}"
+                )
+                self._download_file(url, dest, timestamp)
+
+    @staticmethod
+    def _media_parts(media) -> list[tuple[str, int]]:
+        """(url, media_type) for every file in a post, at source quality."""
+        parts: list[tuple[str, int]] = []
+        if media.media_type == 8:  # carousel / album
+            for resource in media.resources:
+                if resource.media_type == 2 and resource.video_url:
+                    parts.append((str(resource.video_url), 2))
+                elif resource.thumbnail_url:
+                    parts.append((str(resource.thumbnail_url), 1))
+        elif media.media_type == 2 and media.video_url:  # video / reel / IGTV
+            parts.append((str(media.video_url), 2))
+        elif media.thumbnail_url:  # photo
+            parts.append((str(media.thumbnail_url), 1))
+        return parts
+
+    def _download_file(self, url: str, dest: Path, timestamp: float | None) -> None:
+        if dest.exists() and dest.stat().st_size > 0:
+            return  # already on disk from a previous run
+
+        tmp = dest.with_name(dest.name + ".part")
+        last_error: Exception | None = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            self._check_stop()
+            try:
+                with self.http.get(url, stream=True, timeout=(10, 60)) as response:
+                    response.raise_for_status()
+                    with open(tmp, "wb") as f:
+                        for chunk in response.iter_content(CHUNK_SIZE):
+                            self._check_stop()
+                            f.write(chunk)
+                            self.speed.add(len(chunk))
+                            self._emit_progress()
+                os.replace(tmp, dest)
+                if timestamp:
+                    os.utime(dest, (timestamp, timestamp))
+                return
+            except DownloadAborted:
+                tmp.unlink(missing_ok=True)
+                raise
+            except Exception as exc:  # noqa: BLE001 - retry network hiccups
+                tmp.unlink(missing_ok=True)
+                last_error = exc
+                if attempt < MAX_RETRIES:
+                    # Backoff that still reacts to the Stop button instantly.
+                    if self.stop_event.wait(1.5 * attempt):
+                        raise DownloadAborted()
+        raise last_error  # type: ignore[misc]

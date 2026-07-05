@@ -8,8 +8,8 @@ session.json
 cache/
 
 # Downloaded media / resume state (in case downloads land inside the repo)
+# (never name a downloads subfolder "instastash" — macOS git matches case-insensitively)
 downloads/
-InstaStash/
 .instastash_state.json
 *.part
 
