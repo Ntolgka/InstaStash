@@ -26,3 +26,6 @@ env/
 Thumbs.db
 .idea/
 .vscode/
+
+# Local task notes
+Tasks.md
