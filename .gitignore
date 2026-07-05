@@ -4,6 +4,9 @@ Claude/
 # Instagram session — contains auth tokens, NEVER commit
 session.json
 
+# Per-account download memory (media ids only, still local data)
+cache/
+
 # Downloaded media / resume state (in case downloads land inside the repo)
 downloads/
 InstaStash/

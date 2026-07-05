@@ -19,6 +19,11 @@ saved in a collection called `ASD`, it lands in an `ASD/` folder on disk.
 - **Resume support** — if the app stops for any reason (error, Stop button,
   crash, power loss), just start the download again with the same output
   folder: already-downloaded items are detected and skipped automatically.
+- **Only-new-items memory** — the app remembers per account what it has
+  already downloaded (across all runs and output folders). When you save new
+  posts and run it again, it asks Instagram only for the items saved since
+  last time and downloads just those. Toggle with *"Only download new
+  items"*; forget everything with *"Reset download memory"*.
 - **Choose your output folder** — anywhere on your disk.
 - **Session reuse** — after the first login a session is stored locally
   (`session.json`), so future runs usually will not ask Instagram again.
@@ -109,6 +114,23 @@ downloaded item. Start the download again with the same output folder and it
 skips straight to where it left off. Partially downloaded files (`.part`) are
 never counted as finished.
 
+## Downloading only new saves
+
+Also automatic. A per-account memory (`cache/<username>.json`, media ids
+only) records everything ever downloaded. On the next run with *"Only
+download new items"* checked (the default), the app fetches just the items
+you saved since the last successful run — it does not even re-list old
+items, so repeat runs are fast no matter how big your library is. This works
+across output folders: you can download new items into a different folder
+and nothing old is repeated.
+
+- If a run is interrupted or some items fail, the memory deliberately does
+  not advance past them — the next run picks them up again.
+- *"Reset download memory"* (next to the checkbox) makes the app forget the
+  account's history and treat everything as new again.
+- Untick *"Only download new items"* for one run to re-list everything
+  (files already inside the chosen output folder are still skipped).
+
 ## Troubleshooting
 
 | Problem | Fix |
@@ -139,6 +161,7 @@ instastash/
 ├── gui.py              Tkinter interface (login + main screen)
 ├── theme.py            Instagram-inspired palette, fonts, ttk styles
 ├── widgets.py          gradient banner, rounded buttons, custom checkboxes
+├── cache.py            per-account download memory (only-new-items runs)
 ├── client.py           login / session / collections (instagrapi)
 ├── downloader.py       background download worker, speed & ETA, retries
 ├── state.py            resume state (atomic JSON in the output folder)
