@@ -136,7 +136,9 @@ never counted as finished.
 ```
 main.py                 entry point
 instastash/
-├── gui.py              Tkinter interface
+├── gui.py              Tkinter interface (login + main screen)
+├── theme.py            Instagram-inspired palette, fonts, ttk styles
+├── widgets.py          gradient banner, rounded buttons, custom checkboxes
 ├── client.py           login / session / collections (instagrapi)
 ├── downloader.py       background download worker, speed & ETA, retries
 ├── state.py            resume state (atomic JSON in the output folder)
